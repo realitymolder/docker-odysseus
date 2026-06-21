@@ -38,23 +38,8 @@ Images are built automatically via GitHub Actions:
 - **Daily schedule (06:00 UTC)** → tagged as `dev` + date
 - **Manual dispatch** → configurable branch and tag
 
-## Setup
-
-### GitHub Secrets
-
-| Secret | Description |
-|---|---|
-| `DOCKERHUB_USERNAME` | Docker Hub username |
-| `DOCKERHUB_TOKEN` | Docker Hub access token |
-
-### Creating a Docker Hub token
-
-1. Go to [hub.docker.com/settings/security](https://hub.docker.com/settings/security)
-2. Create a new access token (Read & Write)
-3. Add it as `DOCKERHUB_TOKEN` in your GitHub repo settings → Secrets → Actions
-
 ## Links
 
 - [Odysseus upstream](https://github.com/pewdiepie-archdaemon/odysseus)
 - [Docker Hub](https://hub.docker.com/r/realitymolder/odysseus)
-- [CA Templates](https://github.com/realitymolder/odysseus-ca-templates)
+- [Unraid Templates](https://github.com/realitymolder/unraid-templates)
