@@ -1,0 +1,220 @@
+name: Build and publish Odysseus Docker image
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"  # every 4 hours
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: "Upstream branch to build"
+        required: false
+        default: "dev"
+        type: choice
+        options:
+          - main
+          - dev
+      custom_tag:
+        description: "Custom tag (optional, overrides auto-tags)"
+        required: false
+        type: string
+      force:
+        description: "Force build even if no upstream changes"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write  # for creating releases
+
+env:
+  IMAGE_NAME: realitymolder/odysseus
+  UPSTREAM_REPO: pewdiepie-archdaemon/odysseus
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Determine upstream branch and detect changes ──────────────
+      - name: Determine upstream branch
+        id: branch
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ github.event.inputs.upstream_branch }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            BRANCH="main"
+          else
+            BRANCH="dev"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Get upstream latest commit SHA
+        id: upstream
+        run: |
+          SHA=$(curl -sf "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/${{ steps.branch.outputs.branch }}" \
+            | jq -r '.sha')
+          SHORT_SHA=$(echo "$SHA" | cut -c1-7)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream commit: $SHORT_SHA"
+
+      - name: Get last built image SHA from Docker Hub
+        id: last_built
+        run: |
+          # Try to pull the current image and extract the revision label
+          TAG_TO_CHECK="${{ steps.branch.outputs.branch }}"
+          TOKEN=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${{ env.IMAGE_NAME }}:pull" \
+            | jq -r '.token')
+
+          # Get manifest
+          MANIFEST=$(curl -sf \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://registry-1.docker.io/v2/${{ env.IMAGE_NAME }}/manifests/${TAG_TO_CHECK}" 2>/dev/null || echo "{}")
+
+          # Check if it's a manifest list (multi-arch) or single manifest
+          if echo "$MANIFEST" | jq -e '.manifests' >/dev/null 2>&1; then
+            # Multi-arch: get the amd64 manifest digest
+            AMD64_DIGEST=$(echo "$MANIFEST" | jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest' 2>/dev/null)
+            if [ -n "$AMD64_DIGEST" ] && [ "$AMD64_DIGEST" != "null" ]; then
+              MANIFEST=$(curl -sf \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                "https://registry-1.docker.io/v2/${{ env.IMAGE_NAME }}/manifests/$AMD64_DIGEST")
+            fi
+          fi
+
+          # Extract config digest, then fetch config blob to get labels
+          CONFIG_DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest' 2>/dev/null)
+          if [ -n "$CONFIG_DIGEST" ] && [ "$CONFIG_DIGEST" != "null" ]; then
+            CONFIG=$(curl -sf \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://registry-1.docker.io/v2/${{ env.IMAGE_NAME }}/blobs/$CONFIG_DIGEST")
+            LAST_SHA=$(echo "$CONFIG" | jq -r '.config.Labels.revision // empty')
+            echo "last_sha=$LAST_SHA" >> "$GITHUB_OUTPUT"
+            echo "Last built SHA: $(echo "$LAST_SHA" | cut -c1-7)"
+          else
+            echo "last_sha=" >> "$GITHUB_OUTPUT"
+            echo "No existing image found"
+          fi
+
+      - name: Compare SHAs
+        id: compare
+        run: |
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Build forced"
+          elif [ "${{ steps.last_built.outputs.last_sha }}" = "${{ steps.upstream.outputs.sha }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected — skipping build"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commit detected — building"
+          fi
+
+      # ── Checkout upstream Odysseus ───────────────────────────────
+      - name: Checkout upstream Odysseus
+        if: steps.compare.outputs.changed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.branch.outputs.branch }}
+
+      - name: Set up QEMU
+        if: steps.compare.outputs.changed == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.compare.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: steps.compare.outputs.changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── Build tags ───────────────────────────────────────────────
+      - name: Determine tags
+        if: steps.compare.outputs.changed == 'true'
+        id: tags
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          SHORT_SHA="${{ steps.upstream.outputs.short_sha }}"
+          DATE="$(date -u +%Y-%m-%d)"
+          CUSTOM_TAG="${{ github.event.inputs.custom_tag }}"
+
+          TAGS=""
+          add_tag() {
+            if [ -z "$TAGS" ]; then
+              TAGS="$1"
+            else
+              TAGS="$TAGS,$1"
+            fi
+          }
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            add_tag "${{ env.IMAGE_NAME }}:${CUSTOM_TAG}"
+          elif [ "$BRANCH" = "main" ]; then
+            add_tag "${{ env.IMAGE_NAME }}:stable"
+            add_tag "${{ env.IMAGE_NAME }}:stable-${SHORT_SHA}"
+            add_tag "${{ env.IMAGE_NAME }}:stable-${DATE}"
+          else
+            add_tag "${{ env.IMAGE_NAME }}:dev"
+            add_tag "${{ env.IMAGE_NAME }}:dev-${SHORT_SHA}"
+            add_tag "${{ env.IMAGE_NAME }}:dev-${DATE}"
+          fi
+
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Branch: $BRANCH"
+          echo "Tags: $TAGS"
+
+      # ── Build and push ───────────────────────────────────────────
+      - name: Build and push
+        if: steps.compare.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            INSTALL_OPTIONAL=false
+          labels: |
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp || '' }}
+            org.opencontainers.image.authors=realitymolder
+            org.opencontainers.image.url=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.upstream.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.opencontainers.image.vendor=realitymolder
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.title=Odysseus
+            org.opencontainers.image.description=Self-hosted AI workspace Docker image
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Create GitHub Release for stable builds ──────────────────
+      - name: Create GitHub Release
+        if: >
+          steps.compare.outputs.changed == 'true' &&
+          steps.branch.outputs.branch == 'main' &&
+          github.event.inputs.custom_tag == ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "stable-${{ steps.upstream.outputs.short_sha }}"
+          name: "stable ${{ steps.upstream.outputs.short_sha }}"
+          body: |
+            Automated build from upstream commit `${{ steps.upstream.outputs.short_sha }}`
+
+            **Upstream:** [${{ env.UPSTREAM_REPO }}]@`${{ steps.branch.outputs.branch }}`
+
+            **Tags:**
+            - `realitymolder/odysseus:stable`
+            - `realitymolder/odysseus:stable-${{ steps.upstream.outputs.short_sha }}`
+
+            **Upstream commit:** https://github.com/${{ env.UPSTREAM_REPO }}/commit/${{ steps.upstream.outputs.sha }}
+          draft: false
+          prerelease: false
