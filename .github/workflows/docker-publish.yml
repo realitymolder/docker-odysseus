@@ -33,20 +33,20 @@ env:
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # On schedule: build both branches. On manual dispatch: single branch from input.
+        upstream_branch: ${{ github.event_name == 'schedule' && fromJson('["dev","main"]') || fromJson(format('["{0}"]', github.event.inputs.upstream_branch || 'dev')) }}
 
     steps:
       # ── Determine upstream branch and detect changes ──────────────
       - name: Determine upstream branch
         id: branch
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            BRANCH="${{ github.event.inputs.upstream_branch }}"
-          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            BRANCH="main"
-          else
-            BRANCH="dev"
-          fi
+          BRANCH="${{ matrix.upstream_branch }}"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Building upstream branch: $BRANCH"
 
       - name: Get upstream latest commit SHA
         id: upstream
